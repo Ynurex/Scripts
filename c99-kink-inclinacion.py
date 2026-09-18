@@ -12,6 +12,13 @@ helice transmembranal (p. ej. el dominio TM de C99 en una bicapa de POPC):
      Convencion: 0 grados = helice recta. (El "angulo interno" suplementario
      tambien se reporta: 180 - kink.)
 
+     Con --kink-resid se puede pedir el angulo en residuos bisagra concretos
+     (p. ej. --kink-resid 17,21,25). Para cada residuo r se ajusta un eje a la
+     ventana de CA que lo precede y otro a la que lo sigue (excluyendo r y sus
+     vecinos inmediatos) y se reporta el angulo entre ambos, frame a frame.
+     En paralelo se extrae el bend local de HELANAL centrado en ese mismo
+     residuo, como medida independiente del mismo codo.
+
   2) TILT (inclinacion): angulo entre el eje de la helice (o de cada segmento) y
      la normal de la membrana. Se reporta el angulo crudo en [0,180] respecto a
      la normal orientada hacia +z, y el angulo "plegado" en [0,90].
@@ -48,12 +55,18 @@ Salidas
   <prefix>_summary.json     metadatos, argumentos, checks y estadisticas
   <prefix>.png              graficas (si matplotlib esta disponible)
   <prefix>_helanal.csv      (opcional) perfil promedio de bends/twists locales
+  <prefix>_kinks.png        (opcional) angulos en los residuos de --kink-resid
 
 Ejemplo
 -------
   python helix_kink_tilt.py -s md.tpr -f md_center.xtc \
       --resid-range 700-723 --nter 700-707 --cter 712-723 \
       --normal-mode leaflets --axis-method origins --helanal -o c99_tm
+
+  # angulo de kink en residuos concretos (implica --helanal):
+  python helix_kink_tilt.py -s md.tpr -f md_center.xtc \
+      --resid-range 1-40 --kink-resid 17,21,25 --kink-window 7 --kink-gap 1 \
+      -o c99_kinks
 
 Autor: script generado para trabajo de simulacion de membranas (MDAnalysis >= 2.0).
 """
@@ -255,6 +268,20 @@ def parse_range(text):
     return (a, b)
 
 
+def parse_resid_list(text):
+    """'17,21,25', '17 21 25' o '17:21:25' -> [17, 21, 25] (ordenado, sin repetir)."""
+    t = text.replace(":", ",").replace(";", ",").replace(" ", ",")
+    parts = [p for p in t.split(",") if p != ""]
+    try:
+        vals = sorted({int(p) for p in parts})
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "Lista de resid invalida: %r (usa 17,21,25)" % text)
+    if not vals:
+        raise argparse.ArgumentTypeError("Lista de resid vacia: %r" % text)
+    return vals
+
+
 def select_ca(universe, resid_range, extra_sel, ca_name):
     """Selecciona los CA del rango pedido y valida el resultado."""
     lo, hi = resid_range
@@ -328,12 +355,81 @@ def split_segments(resids, args):
     return n_rng, c_rng
 
 
+def resolve_kink_sites(resids, args):
+    """
+    Traduce los residuos de --kink-resid en pares de ventanas flanqueantes.
+
+    Para un residuo bisagra r se ajusta un eje a los <kink-window> CA que lo
+    preceden y otro a los <kink-window> que lo siguen, excluyendo r y los
+    +-<kink-gap> residuos contiguos: el codo deforma la vuelta de helice a cada
+    lado, y meterla en el ajuste contamina los dos ejes a la vez. El kink local
+    es el angulo entre ambos ejes (0 grados = tramo recto).
+
+    Devuelve una lista de dicts con los indices (dentro de la seleccion de CA)
+    de cada ventana.
+    """
+    if not args.kink_resid:
+        return []
+    resids = np.asarray(resids)
+    win = max(1, args.kink_window)
+    gap = max(0, args.kink_gap)
+    sites = []
+    for r in args.kink_resid:
+        hit = np.where(resids == r)[0]
+        if len(hit) == 0:
+            die("El residuo bisagra %d no esta en la seleccion (resid %d-%d). Revisa "
+                "--kink-resid y que --resid-range cubra la bisagra con margen para las "
+                "ventanas." % (r, resids[0], resids[-1]))
+        k = int(hit[0])
+        idx_n = np.arange(max(0, k - gap - win), max(0, k - gap))
+        idx_c = np.arange(min(len(resids), k + gap + 1),
+                          min(len(resids), k + gap + 1 + win))
+        if len(idx_n) < 4 or len(idx_c) < 4:
+            die("El residuo bisagra %d deja solo %d CA antes y %d despues (hacen falta "
+                ">=4 por lado, ~1 vuelta de helice, con --kink-window %d y --kink-gap %d). "
+                "Amplia --resid-range o reduce la ventana."
+                % (r, len(idx_n), len(idx_c), win, gap))
+        if len(idx_n) < win or len(idx_c) < win:
+            warn("Residuo bisagra %d: ventanas recortadas por el borde del rango "
+                 "(%d CA antes, %d despues; se pidieron %d por lado)."
+                 % (r, len(idx_n), len(idx_c), win))
+        if min(len(idx_n), len(idx_c)) < 6 and args.axis_method == "origins":
+            warn("Residuo bisagra %d: alguna ventana tiene <6 CA, asi que su eje se "
+                 "ajusta sobre los CA y no sobre origenes locales; el bamboleo "
+                 "helicoidal puede sesgar el angulo varios grados." % r)
+        site = {"resid": int(r), "idx_n": idx_n, "idx_c": idx_c,
+                "nter": (int(resids[idx_n[0]]), int(resids[idx_n[-1]])),
+                "cter": (int(resids[idx_c[0]]), int(resids[idx_c[-1]]))}
+        sites.append(site)
+        info("Kink en resid %d: ventana N %d-%d (%d CA) vs ventana C %d-%d (%d CA)."
+             % (r, site["nter"][0], site["nter"][1], len(idx_n),
+                site["cter"][0], site["cter"][1], len(idx_c)))
+
+    # Bisagras demasiado juntas: las ventanas de una engloban a otra y el angulo
+    # medido deja de ser el de un solo codo.
+    pedidos = set(args.kink_resid)
+    for site in sites:
+        vecinos = sorted(pedidos & set(resids[np.r_[site["idx_n"], site["idx_c"]]].tolist()))
+        if vecinos:
+            warn("Las ventanas del resid %d contienen tambien la(s) bisagra(s) %s: el "
+                 "angulo 'kink_r%d_deg' suma varios codos, no uno solo. Con bisagras "
+                 "separadas menos de %d residuos usa --kink-window mas corta (>=4 CA por "
+                 "lado) o quedate con el bend local de HELANAL, cuya ventana es de 4 CA."
+                 % (site["resid"], vecinos, site["resid"], win + gap + 1))
+    return sites
+
+
 # --------------------------------------------------------------------------- #
 # Analisis principal
 # --------------------------------------------------------------------------- #
 def run_analysis(args):
     info("MDAnalysis %s | numpy %s | python %s"
          % (mda.__version__, np.__version__, platform.python_version()))
+
+    if args.kink_resid and not args.helanal:
+        args.helanal = True
+        info("--kink-resid activa --helanal: el bend local de HELANAL en cada residuo "
+             "pedido sirve de control independiente del angulo entre ventanas.")
 
     # ---- Universe -------------------------------------------------------- #
     try:
@@ -362,6 +458,8 @@ def run_analysis(args):
             warn("El segmento %s tiene %d CA (<6): se usara SVD sobre CA en lugar de "
                  "origenes locales. Con segmentos tan cortos el bamboleo helicoidal "
                  "puede sesgar el eje varios grados." % (name, len(idx)))
+
+    kink_sites = resolve_kink_sites(resids, args)
 
     lipids = None
     if args.normal_mode != "z":
@@ -408,7 +506,14 @@ def run_analysis(args):
         kink = angle_deg(ax_n, ax_c)                 # 0 = recta
         rise = float(np.dot(pos[-1] - pos[0], ax_full) / max(len(pos) - 1, 1))
 
-        rows.append((
+        # kink en cada residuo bisagra pedido con --kink-resid
+        kink_local = []
+        for site in kink_sites:
+            a_n, _ = helix_axis(pos[site["idx_n"]], args.axis_method, normal)
+            a_c, _ = helix_axis(pos[site["idx_c"]], args.axis_method, normal)
+            kink_local.append(angle_deg(a_n, a_c))
+
+        rows.append([
             ts.frame, float(ts.time),
             kink, 180.0 - kink,
             angle_deg(ax_full, normal), angle_deg(ax_full, normal, fold=True),
@@ -417,7 +522,7 @@ def run_analysis(args):
             normal[0], normal[1], normal[2],
             lin_full, lin_n, lin_c, rise,
             diag.get("thickness_PP", np.nan),
-        ))
+        ] + kink_local)
 
     if not rows:
         die("No se analizo ningun frame. Revisa --first/--last/--stride.")
@@ -430,6 +535,7 @@ def run_analysis(args):
                "normal_x", "normal_y", "normal_z",
                "linearity_full", "linearity_nter", "linearity_cter",
                "rise_per_res_A", "thickness_PP_A"]
+    columns += ["kink_r%d_deg" % s["resid"] for s in kink_sites]
 
     # ---- Diagnosticos globales ------------------------------------------- #
     if n_jumps_frames:
@@ -492,6 +598,33 @@ def run_analysis(args):
                 "twist_resid": resids[off_t:off_t + twists.shape[1]].tolist(),
                 "twist_mean": np.mean(twists, axis=0).tolist(),
             }
+            # bend local de HELANAL, frame a frame, en cada residuo pedido
+            bend_resids = np.asarray(helanal_out["bend_resid"])
+            for site in kink_sites:
+                r = site["resid"]
+                j = np.where(bend_resids == r)[0]
+                name = "bend_helanal_r%d_deg" % r
+                if len(j) == 0:
+                    warn("HELANAL no define bend local en el resid %d: el perfil solo "
+                         "cubre %d-%d (los 3 primeros y 3 ultimos CA del rango no "
+                         "tienen ventana a ambos lados). Se escribe NaN en %s; amplia "
+                         "--resid-range si lo quieres."
+                         % (r, bend_resids[0], bend_resids[-1], name))
+                    col = np.full(data.shape[0], np.nan)
+                elif bends.shape[0] != data.shape[0]:
+                    warn("HELANAL analizo %d frames y el bucle principal %d; no se "
+                         "pueden alinear los bends locales. Se escribe NaN en %s."
+                         % (bends.shape[0], data.shape[0], name))
+                    col = np.full(data.shape[0], np.nan)
+                else:
+                    col = bends[:, int(j[0])]
+                data = np.column_stack([data, col])
+                columns.append(name)
+                helanal_out.setdefault("kink_sites", {})[str(r)] = {
+                    "bend_mean": float(np.nanmean(col)),
+                    "bend_std": float(np.nanstd(col)),
+                }
+
             hinge = resids[off_b + int(np.argmax(np.mean(bends, axis=0)))]
             info("HELANAL: tilt global %.1f +- %.1f deg (plegado a [0,90]: %.1f; el signo "
                  "del eje global de HELANAL es ambiguo, por eso puede salir 180-x); "
@@ -503,7 +636,7 @@ def run_analysis(args):
                 warn("Giro local medio = %.1f deg/residuo (helice alfa ~ 100 deg). "
                      "Puede indicar deformacion, 3-10 o perdida de estructura." % tw)
 
-    return u, data, columns, helanal_out, (n_rng, c_rng), box_lengths_0
+    return u, data, columns, helanal_out, (n_rng, c_rng, kink_sites), box_lengths_0
 
 
 # --------------------------------------------------------------------------- #
@@ -526,6 +659,10 @@ def write_outputs(args, data, columns, helanal_out, segments):
                 "max": float(np.nanmax(v)),
                 "p5": float(np.nanpercentile(v, 5)), "p95": float(np.nanpercentile(v, 95))}
 
+    kink_cols = [c for c in columns if c.startswith("kink_r")]
+    bend_cols = [c for c in columns if c.startswith("bend_helanal_r")]
+    kink_sites = segments[2] if len(segments) > 2 else []
+
     summary = {
         "generated": datetime.now().isoformat(timespec="seconds"),
         "command": " ".join(sys.argv),
@@ -533,11 +670,15 @@ def write_outputs(args, data, columns, helanal_out, segments):
                      "python": platform.python_version()},
         "arguments": {k: (list(v) if isinstance(v, tuple) else v)
                       for k, v in vars(args).items()},
-        "segments": {"nter": list(segments[0]), "cter": list(segments[1])},
+        "segments": {"nter": list(segments[0]), "cter": list(segments[1]),
+                     "kink_sites": [{"resid": s["resid"], "window_nter": list(s["nter"]),
+                                     "window_cter": list(s["cter"])}
+                                    for s in kink_sites]},
         "n_frames_analyzed": int(data.shape[0]),
         "statistics": {c: stats(c) for c in
                        ["kink_deg", "tilt_full_deg", "tilt_full_folded_deg",
-                        "tilt_nter_deg", "tilt_cter_deg", "rise_per_res_A"]},
+                        "tilt_nter_deg", "tilt_cter_deg", "rise_per_res_A"]
+                       + kink_cols + bend_cols},
         "helanal": helanal_out,
         "checks": [{"level": lv, "message": m} for lv, m in CHECKS],
     }
@@ -561,6 +702,25 @@ def write_outputs(args, data, columns, helanal_out, segments):
         s = stats(c)
         print("  %-22s %6.2f +- %5.2f deg   (mediana %6.2f, rango %.2f-%.2f)"
               % (c, s["mean"], s["std"], s["median"], s["min"], s["max"]))
+
+    if kink_cols:
+        print("\n--- Kink por residuo bisagra ---")
+        print("  %-8s %-24s %-22s %s"
+              % ("resid", "ventanas (N vs C)", "kink ventanas (deg)", "bend HELANAL (deg)"))
+        for site in kink_sites:
+            r = site["resid"]
+            kc = "kink_r%d_deg" % r
+            bc = "bend_helanal_r%d_deg" % r
+            sk = stats(kc)
+            win = "%d-%d vs %d-%d" % (site["nter"][0], site["nter"][1],
+                                      site["cter"][0], site["cter"][1])
+            if bc in columns and not np.all(np.isnan(data[:, columns.index(bc)])):
+                sb = stats(bc)
+                btxt = "%6.2f +- %5.2f" % (sb["mean"], sb["std"])
+            else:
+                btxt = "n/d"
+            print("  %-8d %-24s %6.2f +- %5.2f        %s"
+                  % (r, win, sk["mean"], sk["std"], btxt))
     print()
 
     if args.no_plots:
@@ -598,6 +758,8 @@ def write_outputs(args, data, columns, helanal_out, segments):
         e = np.array(helanal_out["bend_std"])
         axes[0, 2].plot(r, b, "o-", ms=3, color="tab:green")
         axes[0, 2].fill_between(r, b - e, b + e, alpha=0.25, color="tab:green")
+        for rk in (args.kink_resid or []):
+            axes[0, 2].axvline(rk, ls=":", c="tab:red", lw=1)
         axes[0, 2].set(xlabel="resid", ylabel="bend local (deg)",
                        title="Perfil HELANAL (localiza la bisagra)")
         axes[1, 2].plot(helanal_out["twist_resid"], helanal_out["twist_mean"],
@@ -609,6 +771,32 @@ def write_outputs(args, data, columns, helanal_out, segments):
     png = "%s.png" % prefix
     fig.savefig(png, dpi=200)
     info("Escrito %s" % png)
+
+    if not kink_cols:
+        return
+
+    fig2, ax2 = plt.subplots(1, 2, figsize=(11, 4))
+    for site in kink_sites:
+        r = site["resid"]
+        v = data[:, columns.index("kink_r%d_deg" % r)]
+        lbl = "resid %d" % r
+        ax2[0].plot(t, v, lw=0.8, label=lbl)
+        ax2[1].hist(v, bins=40, histtype="step", lw=1.4, label=lbl)
+        bc = "bend_helanal_r%d_deg" % r
+        if bc in columns:
+            vb = data[:, columns.index(bc)]
+            if not np.all(np.isnan(vb)):
+                ax2[0].plot(t, vb, lw=0.6, alpha=0.45, ls="--",
+                            label="resid %d (HELANAL)" % r)
+    ax2[0].set(xlabel="tiempo (ns)", ylabel="angulo (deg)",
+               title="Kink por residuo: ventanas (solido) y bend HELANAL (punteado)")
+    ax2[1].set(xlabel="kink de ventanas (deg)", ylabel="cuentas", title="Distribucion")
+    ax2[0].legend(fontsize=7, ncol=2)
+    ax2[1].legend(fontsize=7)
+    fig2.tight_layout()
+    png2 = "%s_kinks.png" % prefix
+    fig2.savefig(png2, dpi=200)
+    info("Escrito %s" % png2)
 
 
 # --------------------------------------------------------------------------- #
@@ -631,6 +819,19 @@ def build_parser():
                    help="Rango de resid del segmento N-terminal (p. ej. 700-707).")
     p.add_argument("--cter", type=parse_range, default=None,
                    help="Rango de resid del segmento C-terminal (p. ej. 712-723).")
+    p.add_argument("--kink-resid", type=parse_resid_list, default=None,
+                   metavar="17,21,25",
+                   help="Residuos donde se hace el kink: calcula el angulo en cada uno "
+                        "entre las ventanas de CA que lo flanquean, y el bend local de "
+                        "HELANAL en el mismo residuo. Implica --helanal.")
+    p.add_argument("--kink-window", type=int, default=7,
+                   help="CA por ventana a cada lado de un residuo de --kink-resid "
+                        "(def. 7; ~2 vueltas de helice). Acortala si las bisagras "
+                        "pedidas estan a menos de --kink-window+--kink-gap+1 residuos "
+                        "entre si, o las ventanas mezclaran varios codos.")
+    p.add_argument("--kink-gap", type=int, default=1,
+                   help="Residuos contiguos a la bisagra excluidos de las ventanas "
+                        "(def. 1; el codo deforma la vuelta vecina).")
     p.add_argument("--gap", type=int, default=2,
                    help="Residuos excluidos en la bisagra al partir por defecto (def. 2).")
     p.add_argument("--min-seg", type=int, default=6,
