@@ -33,6 +33,25 @@ localizar la bisagra) y los giros locales (control de helicidad).
 Disenado para ser generico: sirve para cualquier proteina/helice, cualquier
 lipido y cualquier normal, siempre que se den las selecciones adecuadas.
 
+Entradas y sistemas complejos
+-----------------------------
+  * -s acepta tpr, gro, pdb, psf, ... ; -f es opcional con gro/pdb (se analiza
+    el unico frame). Con un .tpr, -f es obligatorio (gro o trayectoria), porque
+    MDAnalysis no lee bien caja/coordenadas del tpr.
+  * Ojo: con .tpr, MDAnalysis numera los residuos de forma global (1..N en todo
+    el sistema), no con los resid del .gro. Usa --renumber [INICIO].
+  * -n index.ndx + --protein-group: restringe el analisis a un grupo de un
+    indice de GROMACS (por nombre, p. ej. "Protein_chain_A", o por numero como en
+    gmx, 0-based). Imprescindible cuando hay varias proteinas/cadenas o varias
+    copias de la misma molecula: en un .gro no hay segid/chainID y en un .tpr
+    cada copia de un moleculetype repite los mismos resid.
+  * --lipid-group: grupo del indice que define la membrana; dentro de el se
+    aplica --lipid-sel (usa --lipid-sel all para tomar el grupo completo).
+  * --renumber [INICIO]: numera los residuos del grupo INICIO..INICIO+N-1 (def.
+    1) en orden de topologia, de modo que --resid-range/--nter/--cter/
+    --kink-resid se den en esa numeracion (con .tpr, o si la del .gro es global).
+  * --resid-range es opcional: si se omite se usa todo el grupo/seleccion.
+
 Verificaciones internas automaticas
 -----------------------------------
   * Coherencia topologia/trayectoria (numero de atomos, dimensiones de caja).
@@ -67,6 +86,16 @@ Ejemplo
   python helix_kink_tilt.py -s md.tpr -f md_center.xtc \
       --resid-range 1-40 --kink-resid 17,21,25 --kink-window 7 --kink-gap 1 \
       -o c99_kinks
+
+  # solo un .gro, proteina tomada de un indice de GROMACS (sistema con varias
+  # proteinas), membrana definida por otro grupo del indice:
+  python helix_kink_tilt.py -s confout.gro -n index.ndx \
+      --protein-group Protein_chain_B --lipid-group POPC \
+      --resid-range 700-723 -o c99_B
+
+  # tpr + xtc; la proteina del grupo 1 empieza en el resid 672 en el .gro:
+  python helix_kink_tilt.py -s md.tpr -f md.xtc -n index.ndx \
+      --protein-group 1 --renumber 672 --resid-range 700-723 -o tm
 
 Autor: script generado para trabajo de simulacion de membranas (MDAnalysis >= 2.0).
 """
@@ -282,40 +311,162 @@ def parse_resid_list(text):
     return vals
 
 
-def select_ca(universe, resid_range, extra_sel, ca_name):
-    """Selecciona los CA del rango pedido y valida el resultado."""
-    lo, hi = resid_range
-    sel = "name %s and resid %d:%d" % (ca_name, lo, hi)
+def load_ndx(path):
+    """
+    Lee un indice de GROMACS. Devuelve una lista ordenada de (nombre, indices)
+    con indices 0-based (en el .ndx son 1-based). Se conserva el orden del
+    archivo para poder referirse a los grupos por numero, como en gmx.
+    """
+    groups = []
+    current = None
+    try:
+        with open(path) as fh:
+            for ln, line in enumerate(fh, 1):
+                line = line.split(";")[0].strip()
+                if not line:
+                    continue
+                if line.startswith("["):
+                    if not line.endswith("]"):
+                        die("%s:%d: cabecera de grupo mal formada: %r" % (path, ln, line))
+                    current = [line[1:-1].strip(), []]
+                    groups.append(current)
+                elif current is None:
+                    die("%s:%d: hay indices antes de la primera cabecera [ grupo ]." % (path, ln))
+                else:
+                    try:
+                        current[1].extend(int(x) - 1 for x in line.split())
+                    except ValueError:
+                        die("%s:%d: linea no numerica en el grupo '%s': %r"
+                            % (path, ln, current[0], line))
+    except OSError as exc:
+        die("No se pudo leer el indice %s: %s" % (path, exc))
+    if not groups:
+        die("El indice %s no contiene grupos." % path)
+    return [(name, np.asarray(idx, dtype=int)) for name, idx in groups]
+
+
+def format_groups(groups):
+    return "\n".join("  %3d  %-28s %8d atomos" % (i, n, len(idx))
+                     for i, (n, idx) in enumerate(groups))
+
+
+def resolve_group(universe, groups, spec, what):
+    """
+    Devuelve (AtomGroup, nombre) para el grupo 'spec' del indice: primero por
+    nombre exacto, luego sin distinguir mayusculas, luego por numero (0-based,
+    como en gmx). Valida que los indices quepan en el sistema.
+    """
+    spec = str(spec).strip()
+    hit = [g for g in groups if g[0] == spec] or \
+          [g for g in groups if g[0].lower() == spec.lower()]
+    if not hit and spec.lstrip("-").isdigit():
+        k = int(spec)
+        if 0 <= k < len(groups):
+            hit = [groups[k]]
+    if not hit:
+        die("Grupo %s '%s' no encontrado en el indice. Grupos disponibles:\n%s"
+            % (what, spec, format_groups(groups)))
+    if len(hit) > 1:
+        warn("Hay %d grupos llamados '%s' en el indice; se usa el primero."
+             % (len(hit), hit[0][0]))
+    name, idx = hit[0]
+    if len(idx) == 0:
+        die("El grupo %s '%s' esta vacio." % (what, name))
+    n = universe.atoms.n_atoms
+    if idx.min() < 0 or idx.max() >= n:
+        die("El grupo '%s' tiene indices fuera del sistema (max %d, pero el sistema "
+            "tiene %d atomos). El .ndx no corresponde a esta topologia (p. ej. se genero "
+            "con agua/iones y el tpr/gro no los tiene, o al reves)."
+            % (name, idx.max() + 1, n))
+    uniq = np.unique(idx)
+    if len(uniq) != len(idx):
+        warn("El grupo '%s' tiene %d indices repetidos; se ignoran."
+             % (name, len(idx) - len(uniq)))
+    info("Grupo %s del indice: '%s' (%d atomos)." % (what, name, len(uniq)))
+    return universe.atoms[uniq], name
+
+
+def choose_group(groups, what):
+    """Pide el grupo de forma interactiva (como gmx) si hay terminal."""
+    if not sys.stdin.isatty():
+        die("Se paso -n pero no --%s-group. Grupos disponibles:\n%s"
+            % (what, format_groups(groups)))
+    print("Selecciona el grupo para '%s':\n%s" % (what, format_groups(groups)))
+    try:
+        return input("> ").strip()
+    except EOFError:
+        die("No se indico grupo para '%s'." % what)
+
+
+def select_ca(base, base_label, resid_range, extra_sel, ca_name, renumber=False):
+    """
+    Selecciona los CA dentro de 'base' (todo el sistema o un grupo del indice),
+    los filtra por rango de resid y valida el resultado.
+
+    Con renumber=True los residuos de la seleccion se numeran 1..N en orden de
+    topologia y el rango se interpreta en esa numeracion local.
+
+    Devuelve (AtomGroup ordenado N->C, resids usados para el analisis, rango).
+    """
+    sel = "name %s" % ca_name
     if extra_sel:
         sel = "(%s) and (%s)" % (sel, extra_sel)
-    ag = universe.select_atoms(sel)
+    try:
+        ag = base.select_atoms(sel)
+    except Exception as exc:
+        die("Seleccion invalida '%s': %s" % (sel, exc))
+    desc = "'%s' en %s" % (sel, base_label)
     if ag.n_atoms == 0:
-        die("Seleccion vacia: '%s'. Revisa numeracion de resid, nombre de atomo "
-            "(--ca-name) y --select-extra (p.ej. 'segid PROA')." % sel)
+        die("Seleccion vacia: %s. Revisa el nombre de atomo (--ca-name), --select-extra "
+            "y el grupo de proteina (-n/--protein-group)." % desc)
 
-    resids = ag.resids
-    uniq, counts = np.unique(resids, return_counts=True)
-    if np.any(counts > 1):
-        dup = uniq[counts > 1]
-        die("Hay mas de un '%s' por residuo en %s (resids duplicados: %s). "
-            "Probablemente seleccionaste varias cadenas/segmentos o hay altloc. "
-            "Usa --select-extra \"segid PROA\" (o chainID/altloc) para desambiguar."
-            % (ca_name, sel, dup[:10]))
+    if renumber is not None:
+        _, local = np.unique(ag.resindices, return_inverse=True)
+        all_resids = local.astype(int) + int(renumber)
+        info("--renumber: %d residuos con CA en %s numerados %d-%d (resid original "
+             "%d-%d)." % (local.max() + 1, base_label, all_resids.min(),
+                          all_resids.max(), ag.resids.min(), ag.resids.max()))
+    else:
+        all_resids = ag.resids.astype(int)
+
+    if resid_range is None:
+        resid_range = (int(all_resids.min()), int(all_resids.max()))
+        info("Sin --resid-range: se usa toda la seleccion (resid %d-%d)." % resid_range)
+    lo, hi = resid_range
+    mask = (all_resids >= lo) & (all_resids <= hi)
+    ag, resids = ag[mask], all_resids[mask]
+    desc = "%s, resid %d-%d%s" % (desc, lo, hi,
+                                  " (numeracion local)" if renumber is not None else "")
+    if ag.n_atoms == 0:
+        die("Ningun CA en el rango pedido: %s. Resid disponibles: %d-%d. (Con un .tpr, "
+            "MDAnalysis numera los residuos de forma global 1..N, no como en el .gro/.pdb: "
+            "usa --renumber [INICIO].)" % (desc, all_resids.min(), all_resids.max()))
+
+    # mas de un CA por residuo: varias cadenas con los mismos resid o altloc
+    _, counts = np.unique(ag.resindices, return_counts=True)
+    uniq, counts_r = np.unique(resids, return_counts=True)
+    if np.any(counts > 1) or np.any(counts_r > 1):
+        dup = uniq[counts_r > 1] if np.any(counts_r > 1) else "altloc"
+        segs = np.unique(ag.segids)
+        die("Hay mas de un '%s' por residuo en %s (resids duplicados: %s; segids: %s). "
+            "Probablemente hay varias cadenas/copias de la proteina (en un .gro no hay "
+            "segid; en un .tpr cada copia repite resid) o altloc. Restringe con "
+            "-n index.ndx --protein-group <grupo>, o --select-extra \"segid ...\"."
+            % (ca_name, desc, dup if isinstance(dup, str) else dup[:10], segs[:6]))
 
     if not np.all(np.diff(resids) > 0):
-        order = np.argsort(resids)
-        ag = ag[order]
+        order = np.argsort(resids, kind="stable")
+        ag, resids = ag[order], resids[order]
         warn("Los CA no venian ordenados por resid; se reordenaron. Verifica que "
              "el orden en el archivo corresponda a la secuencia real.")
-        resids = ag.resids
 
     esperados = set(range(lo, hi + 1))
     faltantes = sorted(esperados - set(resids.tolist()))
     if faltantes:
         warn("Residuos ausentes en el rango %d-%d: %s. El ajuste del eje usa solo "
              "los presentes (huecos grandes distorsionan el eje)." % (lo, hi, faltantes))
-    info("Seleccion '%s': %d CA (resid %d-%d)." % (sel, ag.n_atoms, resids[0], resids[-1]))
-    return ag
+    info("Seleccion %s: %d CA (resid %d-%d)." % (desc, ag.n_atoms, resids[0], resids[-1]))
+    return ag, resids, (int(lo), int(hi))
 
 
 def check_box(universe):
@@ -432,6 +583,15 @@ def run_analysis(args):
              "pedido sirve de control independiente del angulo entre ventanas.")
 
     # ---- Universe -------------------------------------------------------- #
+    is_tpr = args.topology.lower().endswith(".tpr")
+    if is_tpr and not args.trajectory:
+        die("Con un .tpr hace falta -f (un .gro/.pdb de las mismas coordenadas o la "
+            "trayectoria): MDAnalysis no lee del .tpr la caja ni convierte bien sus "
+            "coordenadas. P. ej.: -s md.tpr -f confout.gro, o -s confout.gro directamente.")
+    if is_tpr and args.renumber is None:
+        info("Topologia .tpr: MDAnalysis numera los residuos de forma global y "
+             "secuencial (1..N en todo el sistema), no con los resid del .top/.gro. "
+             "Usa --renumber [INICIO] para numerar dentro de la proteina.")
     try:
         u = mda.Universe(args.topology, *args.trajectory) if args.trajectory \
             else mda.Universe(args.topology)
@@ -443,9 +603,27 @@ def run_analysis(args):
     dims = check_box(u)
     info("Caja del primer frame: %s A" % np.round(dims[:3], 2))
 
+    # ---- Indice de GROMACS ----------------------------------------------- #
+    groups = None
+    if args.index:
+        groups = load_ndx(args.index)
+        info("Indice %s: %d grupos." % (args.index, len(groups)))
+        if args.protein_group is None:
+            args.protein_group = choose_group(groups, "protein")
+    elif args.protein_group is not None or args.lipid_group is not None:
+        die("--protein-group/--lipid-group requieren un indice (-n index.ndx).")
+
+    if args.protein_group is not None:
+        prot_base, prot_name = resolve_group(u, groups, args.protein_group, "proteina")
+        prot_label = "el grupo '%s'" % prot_name
+        args.protein_group = prot_name
+    else:
+        prot_base, prot_label = u.atoms, "todo el sistema"
+
     # ---- Selecciones ----------------------------------------------------- #
-    full = select_ca(u, args.resid_range, args.select_extra, args.ca_name)
-    resids = full.resids
+    full, resids, args.resid_range = select_ca(
+        prot_base, prot_label, args.resid_range, args.select_extra,
+        args.ca_name, args.renumber)
     n_rng, c_rng = split_segments(resids, args)
 
     idx_n = np.where((resids >= n_rng[0]) & (resids <= n_rng[1]))[0]
@@ -463,12 +641,27 @@ def run_analysis(args):
 
     lipids = None
     if args.normal_mode != "z":
-        lipids = u.select_atoms(args.lipid_sel)
+        if args.lipid_group is not None:
+            lip_base, lip_name = resolve_group(u, groups, args.lipid_group, "membrana")
+            lip_label = "el grupo '%s'" % lip_name
+            args.lipid_group = lip_name
+        else:
+            lip_base, lip_label = u.atoms, "todo el sistema"
+        try:
+            lipids = lip_base.select_atoms(args.lipid_sel)
+        except Exception as exc:
+            die("Seleccion de lipidos invalida '%s': %s" % (args.lipid_sel, exc))
         if lipids.n_atoms < 6:
-            die("Seleccion de lipidos '%s' con %d atomos. Para POPC de CHARMM-GUI el "
-                "default 'name P' suele funcionar; en otros campos de fuerza prueba "
-                "'name P8' o 'name P31'." % (args.lipid_sel, lipids.n_atoms))
-        info("Referencia de membrana: '%s' -> %d atomos." % (args.lipid_sel, lipids.n_atoms))
+            die("Seleccion de lipidos '%s' en %s con %d atomos. Para POPC de CHARMM-GUI "
+                "el default 'name P' suele funcionar; en otros campos de fuerza prueba "
+                "'name P8' o 'name P31' (con --lipid-group, '--lipid-sel all' usa el "
+                "grupo completo)." % (args.lipid_sel, lip_label, lipids.n_atoms))
+        overlap = np.intersect1d(lipids.indices, full.indices)
+        if len(overlap):
+            warn("%d atomos de referencia de membrana pertenecen tambien a la helice "
+                 "analizada; revisa --lipid-sel/--lipid-group." % len(overlap))
+        info("Referencia de membrana: '%s' en %s -> %d atomos."
+             % (args.lipid_sel, lip_label, lipids.n_atoms))
 
     # ---- Loop sobre la trayectoria --------------------------------------- #
     rows = []
@@ -573,9 +766,12 @@ def run_analysis(args):
             mean_normal = unit(data[:, [columns.index("normal_x"),
                                         columns.index("normal_y"),
                                         columns.index("normal_z")]].mean(axis=0))
-            sel = "name %s and resid %d:%d" % (args.ca_name, args.resid_range[0], args.resid_range[1])
-            if args.select_extra:
-                sel = "(%s) and (%s)" % (sel, args.select_extra)
+            # seleccion por indice de atomo: exactamente los mismos CA del analisis
+            # principal (respeta grupo del indice, --renumber y --select-extra).
+            if np.any(np.diff(full.indices) <= 0):
+                warn("Los CA no siguen el orden de indice de atomo; HELANAL los "
+                     "tomara en orden de indice y su perfil puede no ser fiable.")
+            sel = "index " + " ".join(map(str, full.indices))
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 h = hel.HELANAL(u, select=sel, ref_axis=mean_normal,
@@ -813,8 +1009,27 @@ def build_parser():
     p.add_argument("-f", "--trajectory", nargs="*", default=[],
                    help="Trayectoria(s) (xtc, trr, dcd, nc...). Si se omite, se usa "
                         "solo la estructura (un frame).")
-    p.add_argument("--resid-range", type=parse_range, required=True,
-                   help="Rango de resid de la helice completa, p. ej. 700-723.")
+    p.add_argument("-n", "--index", default=None,
+                   help="Indice de GROMACS (.ndx) para identificar la proteina (y "
+                        "opcionalmente la membrana) en sistemas con varias moleculas.")
+    p.add_argument("--protein-group", default=None, metavar="NOMBRE|NUM",
+                   help="Grupo del indice con la proteina/cadena a analizar (nombre o "
+                        "numero 0-based como en gmx). Si se da -n sin este argumento "
+                        "se pregunta interactivamente.")
+    p.add_argument("--lipid-group", default=None, metavar="NOMBRE|NUM",
+                   help="Grupo del indice que contiene la membrana; --lipid-sel se "
+                        "aplica dentro de el (def.: todo el sistema).")
+    p.add_argument("--renumber", type=int, nargs="?", const=1, default=None,
+                   metavar="INICIO",
+                   help="Numerar los residuos de la seleccion consecutivamente desde "
+                        "INICIO (def. 1), en orden de topologia, e interpretar "
+                        "--resid-range/--nter/--cter/--kink-resid en esa numeracion. "
+                        "Util con .tpr (MDAnalysis numera global 1..N): p. ej. "
+                        "--renumber 672 reproduce la numeracion del .gro si la "
+                        "proteina empieza en el resid 672.")
+    p.add_argument("--resid-range", type=parse_range, default=None,
+                   help="Rango de resid de la helice completa, p. ej. 700-723 "
+                        "(def.: toda la seleccion/grupo).")
     p.add_argument("--nter", type=parse_range, default=None,
                    help="Rango de resid del segmento N-terminal (p. ej. 700-707).")
     p.add_argument("--cter", type=parse_range, default=None,
@@ -841,7 +1056,8 @@ def build_parser():
     p.add_argument("--ca-name", default="CA", help="Nombre del atomo de traza (def. CA).")
     p.add_argument("--lipid-sel", default="name P",
                    help="Atomos de referencia de la membrana (def. 'name P'; "
-                        "en CHARMM tambien 'name P' funciona para POPC).")
+                        "en CHARMM tambien 'name P' funciona para POPC). Con "
+                        "--lipid-group se aplica dentro del grupo ('all' = grupo entero).")
     p.add_argument("--normal-mode", choices=["z", "leaflets", "plane"], default="leaflets",
                    help="Como estimar la normal de la membrana (def. leaflets).")
     p.add_argument("--axis-method", choices=["ca", "origins"], default="origins",
